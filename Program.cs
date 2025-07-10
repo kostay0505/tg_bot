@@ -9,11 +9,11 @@ using Telegram.Bot.Types.Enums;
 
 record AdItem
 {
-    public int        Id          { get; init; }
-    public long       ThreadId    { get; set; }           // ID ветки (topic)
-    public string     Text        { get; set; } = "";
-    public TimeOnly[] Times       { get; set; } = Array.Empty<TimeOnly>();
-    public DateOnly   LastPosted  { get; set; }           // чтобы не дублировать в один день
+    public int                        Id          { get; init; }
+    public List<long>                 ThreadIds   { get; set; } = new();        // ID веток (topics)
+    public string                     Text        { get; set; } = "";
+    public TimeOnly[]                 Times       { get; set; } = Array.Empty<TimeOnly>();
+    public Dictionary<long, DateOnly> LastPosted  { get; set; } = new();        // когда постили в каждом топике
 }
 
 #endregion
@@ -95,16 +95,21 @@ class Bot
 
         foreach (var ad in _repo.All())
         {
-            if (ad.LastPosted == today) continue;
             if (!ad.Times.Contains(now)) continue;
 
-            try
+            foreach (var th in ad.ThreadIds)
             {
-                _bot.SendTextMessageAsync(ad.ThreadId, ad.Text, ParseMode.Html).Wait();
-                ad.LastPosted = today;
-                _repo.Update(ad);
+                if (ad.LastPosted.TryGetValue(th, out var d) && d == today)
+                    continue;
+
+                try
+                {
+                    _bot.SendTextMessageAsync(th, ad.Text, ParseMode.Html).Wait();
+                    ad.LastPosted[th] = today;
+                    _repo.Update(ad);
+                }
+                catch (Exception ex) { Console.WriteLine(ex.Message); }
             }
-            catch (Exception ex) { Console.WriteLine(ex.Message); }
         }
     }
 
@@ -165,18 +170,26 @@ class Bot
         switch (s)
         {
             case State.WaitTopics:
-                if (!ToggleTopics(d, txt))
+                if (ToggleTopics(d, txt))
                 {
-                    if (txt.Equals("далее", StringComparison.OrdinalIgnoreCase))
+                    await _bot.SendTextMessageAsync(chat, TopicsChecklist(chat));
+                }
+                else if (txt.Equals("далее", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (d.ThreadIds.Count == 0)
+                    {
+                        await _bot.SendTextMessageAsync(chat, "Выберите хотя бы один топик");
+                    }
+                    else
                     {
                         _state[chat] = State.WaitTimes;
                         await _bot.SendTextMessageAsync(chat,
                             "Шаг 2/3: время (через пробел, 24 ч, HH:mm)\nнапр. `09:00 15:00`",
                             parseMode: ParseMode.Markdown);
                     }
-                    else
-                        await _bot.SendTextMessageAsync(chat, TopicsChecklist(chat));
                 }
+                else
+                    await _bot.SendTextMessageAsync(chat, TopicsChecklist(chat));
                 break;
 
             case State.WaitTimes:
@@ -224,11 +237,12 @@ class Bot
             await _bot.SendTextMessageAsync(chat,"Объявлений нет", cancellationToken: ct); return;
         }
 
-        var sb = new StringBuilder("```\nID  Thread  Время       Текст\n");
+        var sb = new StringBuilder("```\nID  Threads         Время       Текст\n");
         foreach (var a in _repo.All())
         {
             var t = string.Join(',', a.Times.Select(x => x.ToString("HH:mm")));
-            sb.Append($"{a.Id,-3} {a.ThreadId,-7} {t,-10} {Truncate(a.Text)}\n");
+            var th = string.Join(',', a.ThreadIds);
+            sb.Append($"{a.Id,-3} {th,-14} {t,-10} {Truncate(a.Text)}\n");
         }
         sb.Append("```");
         await _bot.SendTextMessageAsync(chat, sb.ToString(),
@@ -254,8 +268,9 @@ class Bot
         var ad = _repo.All().FirstOrDefault(a => a.Id == id);
         if (ad is null) { await _bot.SendTextMessageAsync(chat,"Нет такого id"); return; }
 
-        await _bot.SendTextMessageAsync(ad.ThreadId, ad.Text, parseMode: ParseMode.Html, cancellationToken: ct);
-        await _bot.SendTextMessageAsync(chat,"Отправлено", cancellationToken: ct);
+        foreach (var th in ad.ThreadIds)
+            await _bot.SendTextMessageAsync(th, ad.Text, parseMode: ParseMode.Html, cancellationToken: ct);
+        await _bot.SendTextMessageAsync(chat, "Отправлено", cancellationToken: ct);
     }
 
     private void StartEdit(string[] parts,long chat)
@@ -302,7 +317,7 @@ class Bot
         var sb = new StringBuilder("Нажимайте, чтобы включать/выключать:\n");
         foreach (var kv in _topics)
         {
-            var mark = (d.ThreadId == kv.Value) ? "✅" : "❌";
+            var mark = d.ThreadIds.Contains(kv.Value) ? "✅" : "❌";
             sb.AppendLine($"{mark} {kv.Key}");
         }
         sb.Append("\n«Далее» — переход к выбору времени");
@@ -313,7 +328,10 @@ class Bot
     {
         if (_topics.TryGetValue(txt, out var id))
         {
-            d.ThreadId = id;
+            if (d.ThreadIds.Contains(id))
+                d.ThreadIds.Remove(id);
+            else
+                d.ThreadIds.Add(id);
             return true;
         }
         return false;
